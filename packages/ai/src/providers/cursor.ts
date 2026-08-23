@@ -232,13 +232,16 @@ function cursorExecDeadlineMs(idleTimeoutMs: number | undefined): number {
 }
 
 function runWithCursorExecDeadline<T>(
-	operation: (signal: AbortSignal) => Promise<T>,
+	operation: (signal: AbortSignal, markNonAbortable: () => void) => Promise<T>,
 	signal: AbortSignal | undefined,
 	deadlineMs: number,
+	onNonAbortableStarted?: (settled: Promise<void>) => void,
 ): Promise<T> {
 	const result = Promise.withResolvers<T>();
 	const controller = new AbortController();
 	let settled = false;
+	let nonAbortableStarted = false;
+	let abortError: Error | undefined;
 	let timer: NodeJS.Timeout | undefined;
 
 	const cleanup = () => {
@@ -253,8 +256,9 @@ function runWithCursorExecDeadline<T>(
 	};
 	const onAbort = () => {
 		if (signal) {
-			controller.abort(cursorAbortError(signal));
-			settle(() => result.reject(cursorAbortError(signal)));
+			abortError = cursorAbortError(signal);
+			controller.abort(abortError);
+			if (!nonAbortableStarted) settle(() => result.reject(abortError!));
 		}
 	};
 
@@ -268,12 +272,21 @@ function runWithCursorExecDeadline<T>(
 		// The deadline cannot forcibly cancel the handler's local work; it aborts
 		// the per-exec signal so cooperative tools stop, and the rejection below
 		// still bounds how long this turn waits for the handler promise.
-		controller.abort(new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`));
-		settle(() => result.reject(new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`)));
+		abortError = new Error(`Cursor local exec exceeded its ${deadlineMs}ms deadline`);
+		controller.abort(abortError);
+		if (!nonAbortableStarted) settle(() => result.reject(abortError!));
 	}, deadlineMs);
-	void operation(controller.signal).then(
-		value => settle(() => result.resolve(value)),
-		error => settle(() => result.reject(error)),
+	void operation(controller.signal, () => {
+		nonAbortableStarted = true;
+		onNonAbortableStarted?.(
+			result.promise.then(
+				() => undefined,
+				() => undefined,
+			),
+		);
+	}).then(
+		value => settle(() => (abortError ? result.reject(abortError) : result.resolve(value))),
+		error => settle(() => result.reject(abortError ?? error)),
 	);
 	return result.promise;
 }
@@ -572,15 +585,23 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 		let transportWatchdog: NodeJS.Timeout | null = null;
 		let transportWatchdogClosed = false;
 		let callerAbortError: Error | undefined;
+		let pendingNonAbortableExec: Promise<void> | undefined;
+		const closeForCallerAbort = () => {
+			h2Request?.close();
+			h2Client?.close();
+			proxiedSocket?.destroy();
+			settleH2(callerAbortError!);
+		};
 		const onCallerAbort = () => {
 			const signal = options?.signal;
 			if (!signal) return;
 			if (callerAbortError) return;
 			callerAbortError = cursorAbortError(signal);
-			h2Request?.close();
-			h2Client?.close();
-			proxiedSocket?.destroy();
-			settleH2(callerAbortError);
+			if (pendingNonAbortableExec) {
+				void pendingNonAbortableExec.finally(closeForCallerAbort);
+				return;
+			}
+			closeForCallerAbort();
 		};
 		// Abort fence: install the listener before any setup work so a caller that
 		// aborts during payload construction or a proxy handshake can never lose the
@@ -799,7 +820,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							if (isExecServerMessage) clearTransportWatchdog();
 							let execSucceeded = false;
 							try {
-								const run = (execSignal?: AbortSignal) =>
+								const run = (execSignal?: AbortSignal, markNonAbortable?: () => void) =>
 									handleServerMessage(
 										serverMessage,
 										output,
@@ -814,12 +835,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 										onConversationCheckpoint,
 										requestContextRules,
 										execSignal,
+										markNonAbortable,
 									);
 								if (isExecServerMessage) {
 									// The deadline races the handler promise but the per-exec
 									// AbortSignal it owns reaches cooperative handlers so caller
 									// cancellation and the local deadline can actually stop work.
-									await runWithCursorExecDeadline(run, options?.signal, cursorExecDeadlineMs(idleTimeoutMs));
+									await runWithCursorExecDeadline(
+										run,
+										options?.signal,
+										cursorExecDeadlineMs(idleTimeoutMs),
+										settled => {
+											pendingNonAbortableExec = settled;
+										},
+									);
 								} else {
 									await run();
 								}
@@ -997,6 +1026,7 @@ async function handleServerMessage(
 	onConversationCheckpoint?: (checkpoint: ConversationStateStructure) => void,
 	requestContextRules: CursorRule[] = [],
 	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<void> {
 	const msgCase = msg.message.case;
 
@@ -1017,6 +1047,7 @@ async function handleServerMessage(
 			stream,
 			requestContextRules,
 			execSignal,
+			markNonAbortable,
 		);
 	} else if (msgCase === "conversationCheckpointUpdate") {
 		handleConversationCheckpointUpdate(msg.message.value, output, usageState, onConversationCheckpoint);
@@ -1382,6 +1413,7 @@ async function handleExecServerMessage(
 	stream: AssistantMessageEventStream,
 	requestContextRules: CursorRule[] = [],
 	execSignal?: AbortSignal,
+	markNonAbortable?: () => void,
 ): Promise<void> {
 	const execCase = execMsg.message.case;
 	log("exec", "dispatch", { execCase, execId: execMsg.execId, hasHandlers: !!execHandlers });
@@ -1668,7 +1700,7 @@ async function handleExecServerMessage(
 				path: args.path,
 				content: args.content,
 			});
-			const call = { args, toolCallId, signal: execSignal };
+			const call = { args, toolCallId, signal: execSignal, markNonAbortable };
 			const { execResult } = await resolveExecHandler(
 				call,
 				execHandlers?.piWrite?.bind(execHandlers),
