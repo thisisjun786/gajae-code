@@ -12,6 +12,18 @@ import { BashTool, type BashToolInput } from "../../src/tools/bash";
 import * as shellSnapshot from "../../src/utils/shell-snapshot";
 import { stubBashExecutorSettings } from "../helpers/tool-session-settings";
 
+function createBashSettings(rules: BashInterceptorRule[], overrides: Record<string, unknown> = {}): Settings {
+	const settings = Settings.isolated({
+		"bashInterceptor.enabled": true,
+		"async.enabled": false,
+		"bash.autoBackground.enabled": false,
+		"bash.autoBackground.thresholdMs": 60_000,
+		...overrides,
+	});
+	vi.spyOn(settings, "getBashInterceptorRules").mockReturnValue(rules);
+	return settings;
+}
+
 afterEach(async () => {
 	vi.restoreAllMocks();
 	await disposeAllShellSessions();
