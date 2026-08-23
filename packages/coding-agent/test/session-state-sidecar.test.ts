@@ -8,6 +8,7 @@ import { postmortem } from "@gajae-code/utils";
 import { FileLockTestHooks } from "../src/config/file-lock";
 import { loadInstallationHostId } from "../src/config/machine-identity";
 import { sessionRuntimeDir } from "../src/gjc-runtime/session-layout";
+import { SessionStateLockTestHooks } from "../src/gjc-runtime/session-state-lock";
 import {
 	canonicalCoordinatorSidecarPayload,
 	classifyRuntimeToolActivity,
@@ -101,6 +102,7 @@ function git(cwd: string, args: string[]): void {
 
 afterEach(async () => {
 	FileLockTestHooks.afterParentMkdir = undefined;
+	SessionStateLockTestHooks.unqualifiedOwnerIsLocal = undefined;
 	setSystemTime();
 	if (ORIGINAL_STATE_FILE === undefined) delete process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV];
 	else process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = ORIGINAL_STATE_FILE;
@@ -1967,12 +1969,13 @@ describe("coordinator runtime state sidecar", () => {
 		const stateFile = path.join(root, "runtime-state.json");
 		process.env[GJC_COORDINATOR_SESSION_STATE_FILE_ENV] = stateFile;
 		process.env[GJC_COORDINATOR_SESSION_ID_ENV] = "orphaned-runtime-lock";
+		SessionStateLockTestHooks.unqualifiedOwnerIsLocal = true;
 		await fs.mkdir(`${stateFile}.lock`);
 		await Bun.write(
 			`${stateFile}.lock/info`,
 			JSON.stringify({
-				pid: 999_999_999,
-				start_time: "0",
+				pid: 2 ** 22 - 1,
+				start_time: "whenever",
 				timestamp: Date.now() - 60_000,
 				owner_host_id: await loadInstallationHostId(),
 			}),
