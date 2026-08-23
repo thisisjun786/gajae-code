@@ -1827,6 +1827,8 @@ pub(crate) mod platform {
 	#[cfg(target_os = "linux")]
 	use std::os::unix::fs::MetadataExt;
 	#[cfg(test)]
+	use std::sync::atomic::AtomicBool;
+	#[cfg(test)]
 	use std::sync::{Mutex, OnceLock, mpsc};
 	use std::{
 		borrow::Cow,
@@ -1995,6 +1997,8 @@ pub(crate) mod platform {
 	static SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
+	#[cfg(test)]
+	static FAIL_SECURE_SKILL_CLEANUP: AtomicBool = AtomicBool::new(false);
 
 	static NEXT_SECURE_SKILL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -2100,6 +2104,11 @@ pub(crate) mod platform {
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn inject_secure_skill_cleanup_failure(enabled: bool) {
+		FAIL_SECURE_SKILL_CLEANUP.store(enabled, Ordering::Relaxed);
 	}
 
 	#[cfg(test)]
@@ -4575,7 +4584,11 @@ pub(crate) mod platform {
 		clippy::undocumented_unsafe_blocks,
 		reason = "the retained directory descriptor owns private cleanup after failed publication"
 	)]
-	fn unlink_private_skill_file(parent_fd: libc::c_int, name: &CString, private_fd: libc::c_int) {
+	fn unlink_private_skill_file(
+		parent_fd: libc::c_int,
+		name: &CString,
+		private_fd: libc::c_int,
+	) -> Result<(), &'static str> {
 		let mut opened: libc::stat = unsafe { std::mem::zeroed() };
 		let mut named: libc::stat = unsafe { std::mem::zeroed() };
 		let same = unsafe { libc::fstat(private_fd, &mut opened) } == 0
@@ -4583,10 +4596,31 @@ pub(crate) mod platform {
 				libc::fstatat(parent_fd, name.as_ptr(), &mut named, libc::AT_SYMLINK_NOFOLLOW)
 			} == 0 && opened.st_dev == named.st_dev
 			&& opened.st_ino == named.st_ino;
-		if same {
-			unsafe {
-				libc::unlinkat(parent_fd, name.as_ptr(), 0);
-			}
+		if !same {
+			return Err("cleanup_failed");
+		}
+		#[cfg(test)]
+		if FAIL_SECURE_SKILL_CLEANUP.swap(false, Ordering::Relaxed) {
+			return Err("cleanup_failed");
+		}
+		if unsafe { libc::unlinkat(parent_fd, name.as_ptr(), 0) } != 0 {
+			return Err("cleanup_failed");
+		}
+		Ok(())
+	}
+
+	fn cleanup_private_skill_file(
+		file: &File,
+		parent_fd: libc::c_int,
+		name: &CString,
+	) -> Result<(), &'static str> {
+		let private_fd = file.as_raw_fd();
+		let scrubbed = file.set_len(0).is_ok();
+		let unlinked = unlink_private_skill_file(parent_fd, name, private_fd).is_ok();
+		if scrubbed && unlinked {
+			Ok(())
+		} else {
+			Err("cleanup_failed")
 		}
 	}
 
@@ -4600,7 +4634,7 @@ pub(crate) mod platform {
 		skill_name: &str,
 		content: &str,
 	) -> NativeSecureSkillWriteResult {
-		let (skills_fd, canonical_root) = match open_or_create_skill_root(root_path) {
+		let (skills_fd, _canonical_root) = match open_or_create_skill_root(root_path) {
 			Ok(value) => value,
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
@@ -4640,26 +4674,23 @@ pub(crate) mod platform {
 			},
 		};
 		if file.write_all(content.as_bytes()).is_err() {
-			let _ = file.set_len(0);
-			let private_fd = file.as_raw_fd();
-			unlink_private_skill_file(skill_fd, &private_name, private_fd);
+			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
 			drop(file);
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
 			}
-			return NativeSecureSkillWriteResult::failure("write_failed");
+			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or("write_failed"));
 		}
 		let private_fd = file.as_raw_fd();
 		if let Err(code) = replace_skill_file_name(skill_fd, &private_name, &final_name, private_fd) {
-			let _ = file.set_len(0);
-			unlink_private_skill_file(skill_fd, &private_name, private_fd);
+			let cleanup = cleanup_private_skill_file(&file, skill_fd, &private_name);
 			drop(file);
 			unsafe {
 				libc::close(skill_fd);
 				libc::close(skills_fd);
 			}
-			return NativeSecureSkillWriteResult::failure(code);
+			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 		}
 		drop(file);
 		unsafe {
@@ -4667,7 +4698,7 @@ pub(crate) mod platform {
 			libc::close(skills_fd);
 		}
 		NativeSecureSkillWriteResult::success(
-			canonical_root
+			root_path
 				.join(skill_name)
 				.join("SKILL.md")
 				.to_string_lossy()
@@ -6301,6 +6332,8 @@ pub(crate) mod platform {
 #[cfg(windows)]
 mod platform {
 	#[cfg(test)]
+	use std::sync::atomic::AtomicBool;
+	#[cfg(test)]
 	use std::sync::{Mutex, OnceLock, mpsc};
 	use std::{
 		ffi::{OsString, c_void},
@@ -6370,6 +6403,8 @@ mod platform {
 	static SECURE_SKILL_WRITE_BEFORE_RENAME_HOOK: OnceLock<
 		Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
 	> = OnceLock::new();
+	#[cfg(test)]
+	static FAIL_SECURE_SKILL_CLEANUP: AtomicBool = AtomicBool::new(false);
 	static NEXT_SECURE_SKILL_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 	#[cfg(test)]
@@ -6402,6 +6437,11 @@ mod platform {
 			.get_or_init(|| Mutex::new(None))
 			.lock()
 			.unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+	}
+
+	#[cfg(test)]
+	pub(super) fn inject_secure_skill_cleanup_failure(enabled: bool) {
+		FAIL_SECURE_SKILL_CLEANUP.store(enabled, Ordering::Relaxed);
 	}
 
 	#[cfg(test)]
@@ -9157,6 +9197,23 @@ mod platform {
 		rename_handle(handle, parent, final_name, true)
 	}
 
+	fn cleanup_private_skill_file(handle: HANDLE) -> Result<(), &'static str> {
+		let scrubbed = truncate_and_write_skill_file(handle, &[]).is_ok();
+		#[cfg(test)]
+		let deleted = if FAIL_SECURE_SKILL_CLEANUP.swap(false, Ordering::Relaxed) {
+			false
+		} else {
+			delete_handle(handle).is_ok()
+		};
+		#[cfg(not(test))]
+		let deleted = delete_handle(handle).is_ok();
+		if scrubbed && deleted {
+			Ok(())
+		} else {
+			Err("cleanup_failed")
+		}
+	}
+
 	#[expect(
 		clippy::undocumented_unsafe_blocks,
 		reason = "all writes use the retained no-follow authority and are preceded by identity \
@@ -9190,16 +9247,15 @@ mod platform {
 			Err(code) => return NativeSecureSkillWriteResult::failure(code),
 		};
 		if let Err(code) = truncate_and_write_skill_file(file, content.as_bytes()) {
-			let _ = delete_handle(file);
+			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };
-			return NativeSecureSkillWriteResult::failure(code);
+			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 		}
 		let final_name: Vec<u16> = file_name.encode_wide().collect();
 		if let Err(code) = replace_skill_file_name(file, skills.target, &final_name) {
-			let _ = truncate_and_write_skill_file(file, &[]);
-			let _ = delete_handle(file);
+			let cleanup = cleanup_private_skill_file(file);
 			unsafe { CloseHandle(file) };
-			return NativeSecureSkillWriteResult::failure(code);
+			return NativeSecureSkillWriteResult::failure(cleanup.err().unwrap_or(code));
 		}
 		unsafe { CloseHandle(file) };
 		NativeSecureSkillWriteResult::success(
@@ -9572,6 +9628,46 @@ mod secure_skill_write_windows_tests {
 			fs::read_to_string(skill.join("SKILL.md")).expect("read published file"),
 			"private-stage"
 		);
+	}
+
+	#[test]
+	fn cleanup_failure_is_reported_after_private_payload_scrub() {
+		let _guard = HOOK_LOCK
+			.lock()
+			.unwrap_or_else(|poisoned| poisoned.into_inner());
+		let temporary = TempDir::new();
+		let root = temporary.0.join(".gjc").join("skills");
+		let skill = root.join("managed");
+		let (entered_tx, entered_rx) = mpsc::channel();
+		let (resume_tx, resume_rx) = mpsc::channel();
+		platform::set_secure_skill_write_before_rename_hook(Some((entered_tx, resume_rx)));
+		let root_for_write = root.clone();
+		let writer = thread::spawn(move || {
+			secure_write_skill_file(
+				root_for_write.to_string_lossy().into_owned(),
+				"managed".to_owned(),
+				"private-stage".to_owned(),
+			)
+		});
+		entered_rx.recv().expect("wait for private-file write");
+		let private = fs::read_dir(&skill)
+			.expect("read skill directory")
+			.map(|entry| entry.expect("read private entry").path())
+			.find(|path| {
+				path
+					.file_name()
+					.is_some_and(|name| name.to_string_lossy().starts_with(".gjc-skill-write-"))
+			})
+			.expect("private skill file");
+		fs::create_dir(skill.join("SKILL.md")).expect("block final replacement with a directory");
+		platform::inject_secure_skill_cleanup_failure(true);
+		resume_tx.send(()).expect("release private-file write");
+		let result = writer.join().expect("secure skill writer thread");
+		platform::set_secure_skill_write_before_rename_hook(None);
+
+		assert!(!result.ok);
+		assert_eq!(result.code.as_deref(), Some("cleanup_failed"));
+		assert_eq!(fs::read(&private).expect("read retained scrubbed private file"), b"");
 	}
 
 	#[test]
@@ -11756,13 +11852,15 @@ mod secure_skill_write_tests {
 			})
 			.expect("private skill file");
 		fs::hard_link(&private, &outside).expect("link private staging file");
+		platform::inject_secure_skill_cleanup_failure(true);
 		resume_tx.send(()).expect("release private-file write");
 		let result = writer.join().expect("secure skill writer thread");
 		platform::set_secure_skill_write_before_rename_hook(None);
 
 		assert!(!result.ok);
-		assert_eq!(result.code.as_deref(), Some("identity_mismatch"));
+		assert_eq!(result.code.as_deref(), Some("cleanup_failed"));
 		assert_eq!(fs::read(&outside).expect("read scrubbed private alias"), b"");
+		assert_eq!(fs::read(&private).expect("read retained scrubbed private file"), b"");
 		assert!(!skill.join("SKILL.md").exists());
 	}
 
