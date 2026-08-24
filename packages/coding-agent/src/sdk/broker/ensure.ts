@@ -455,8 +455,17 @@ function hasCompletePackageAuthority(discovery: BrokerDiscovery): boolean {
 	return typeof discovery.packageVersion === "string" && typeof discovery.installationIdentity === "string";
 }
 
+function isAbsentPackageAuthorityField(value: string | undefined | null): boolean {
+	return value == null || value === "";
+}
+
 function isLegacyUnstampedDiscovery(discovery: BrokerDiscovery): boolean {
-	return !hasCompletePackageAuthority(discovery);
+	const generation = discovery.packageGeneration as string | undefined | null;
+	return (
+		(generation === "unknown" || isAbsentPackageAuthorityField(generation)) &&
+		isAbsentPackageAuthorityField(discovery.packageVersion) &&
+		isAbsentPackageAuthorityField(discovery.installationIdentity)
+	);
 }
 
 function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): string {

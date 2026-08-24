@@ -672,8 +672,16 @@ describe("sdk broker package generation", () => {
 				authority,
 			),
 		).toBe(false);
-		expect(isLegacyUnstampedDiscoveryForTest({ ...base, packageVersion: undefined })).toBe(true);
-		expect(isLegacyUnstampedDiscoveryForTest({ ...base, installationIdentity: undefined })).toBe(true);
+		expect(isLegacyUnstampedDiscoveryForTest({ ...base, packageVersion: undefined })).toBe(false);
+		expect(isLegacyUnstampedDiscoveryForTest({ ...base, installationIdentity: undefined })).toBe(false);
+		expect(
+			isLegacyUnstampedDiscoveryForTest({
+				...base,
+				packageGeneration: "unknown",
+				packageVersion: undefined,
+				installationIdentity: undefined,
+			}),
+		).toBe(true);
 		expect(isLegacyUnstampedDiscoveryForTest(base)).toBe(false);
 	});
 
