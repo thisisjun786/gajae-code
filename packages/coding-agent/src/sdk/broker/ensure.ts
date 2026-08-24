@@ -472,7 +472,10 @@ function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): 
 	const discoveryPath = brokerDiscoveryPath(agentDir);
 	if (!isPidAlive(stale.pid)) return ` The published pid ${stale.pid} is gone; delete ${discoveryPath}.`;
 	const incarnation = brokerProcessIncarnation(stale.pid);
-	if (incarnation !== undefined && incarnation !== "" && incarnation !== stale.incarnation) {
+	if (incarnation === undefined || incarnation === "") {
+		return ` Published pid ${stale.pid} has no verifiable incarnation; do not signal it. Delete ${discoveryPath} only after confirming it is not the SDK broker.`;
+	}
+	if (incarnation !== stale.incarnation) {
 		return ` Published pid ${stale.pid} is live with a different incarnation; do not signal it. Delete ${discoveryPath} only after confirming it is not the SDK broker.`;
 	}
 	return ` Stop the broker at pid ${stale.pid} before deleting ${discoveryPath}.`;
