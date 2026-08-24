@@ -469,7 +469,7 @@ function isLegacyUnstampedDiscovery(discovery: BrokerDiscovery): boolean {
 }
 
 function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): string {
-	return ` Stop the broker at pid ${stale.pid}, or delete ${brokerDiscoveryPath(agentDir)}.`;
+	return ` Stop the broker at pid ${stale.pid} before deleting ${brokerDiscoveryPath(agentDir)}.`;
 }
 function unstampedProcessGone(stale: BrokerDiscovery): boolean {
 	return !isPidAlive(stale.pid);

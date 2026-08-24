@@ -92,7 +92,7 @@ function ownedTestChild(): ChildProcess & { signals: NodeJS.Signals[] } {
 	}) as unknown as ChildProcess & { signals: NodeJS.Signals[] };
 }
 function standInBrokerProcess(): { pid: number; incarnation: string; kill: () => void } {
-	const child = spawn("sleep", ["3600"], { stdio: "ignore" });
+	const child = spawn(process.execPath, ["-e", "await Bun.sleep(3_600_000)"], { stdio: "ignore" });
 	if (child.pid === undefined) throw new Error("stand-in broker pid unavailable");
 	const incarnation = brokerProcessIncarnation(child.pid);
 	if (!incarnation) throw new Error("stand-in broker incarnation unavailable");
@@ -366,7 +366,7 @@ describe("sdk broker package generation", () => {
 				heartbeatAt: Date.now(),
 			});
 			await expect(ensureBroker({ agentDir: dir, expectedPackageGeneration: authority.generation })).rejects.toThrow(
-				`stale broker retirement was not verified. Stop the broker at pid ${pid}, or delete ${brokerDiscoveryPath(dir)}.`,
+				`stale broker retirement was not verified. Stop the broker at pid ${pid} before deleting ${brokerDiscoveryPath(dir)}.`,
 			);
 			expect(signalRoot).not.toHaveBeenCalled();
 		} finally {
@@ -505,7 +505,7 @@ describe("sdk broker package generation", () => {
 					heartbeatTtlMs: 500,
 				}),
 			).rejects.toThrow(
-				`stale broker retirement was not verified. Stop the broker at pid ${process.pid}, or delete ${brokerDiscoveryPath(dir)}.`,
+				`stale broker retirement was not verified. Stop the broker at pid ${process.pid} before deleting ${brokerDiscoveryPath(dir)}.`,
 			);
 			expect(await readBrokerDiscovery(dir, 500)).toBeNull();
 			const retained = JSON.parse(await fs.readFile(brokerDiscoveryPath(dir), "utf8")) as { pid: number };
@@ -542,7 +542,7 @@ describe("sdk broker package generation", () => {
 					expectedPackageGeneration: authority.generation,
 				}),
 			).rejects.toThrow(
-				`stale broker retirement was not verified. Stop the broker at pid ${process.pid}, or delete ${brokerDiscoveryPath(dir)}.`,
+				`stale broker retirement was not verified. Stop the broker at pid ${process.pid} before deleting ${brokerDiscoveryPath(dir)}.`,
 			);
 			expect(connect).toHaveBeenCalled();
 		} finally {
@@ -589,7 +589,7 @@ describe("sdk broker package generation", () => {
 					expectedPackageGeneration: authority.generation,
 				}),
 			).rejects.toThrow(
-				`stale broker retirement was not verified. Stop the broker at pid ${pid}, or delete ${brokerDiscoveryPath(dir)}.`,
+				`stale broker retirement was not verified. Stop the broker at pid ${pid} before deleting ${brokerDiscoveryPath(dir)}.`,
 			);
 			expect(signalRoot).not.toHaveBeenCalled();
 		} finally {
