@@ -474,6 +474,22 @@ function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): 
 function unstampedProcessGone(stale: BrokerDiscovery): boolean {
 	return !isPidAlive(stale.pid);
 }
+async function peekUnstampedLiveBroker(agentDir: string): Promise<BrokerDiscovery | null> {
+	try {
+		const raw: unknown = JSON.parse(await fs.readFile(brokerDiscoveryPath(agentDir), "utf8"));
+		if (!raw || typeof raw !== "object") return null;
+		const discovery = raw as BrokerDiscovery;
+		if (!isLegacyUnstampedDiscovery(discovery)) return null;
+		if (!Number.isSafeInteger(discovery.pid) || discovery.pid <= 0) return null;
+		if (typeof discovery.incarnation !== "string" || discovery.incarnation.length === 0) return null;
+		if (typeof discovery.url !== "string" || typeof discovery.token !== "string") return null;
+		if (!isPidAlive(discovery.pid)) return null;
+		return discovery;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" || error instanceof SyntaxError) return null;
+		throw error;
+	}
+}
 
 async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
 	try {
@@ -823,6 +839,18 @@ async function ensureBrokerOnce(settings: EnsureBrokerSettings, initiator: Ensur
 		if (!stale) return { kind: "external-discovery", discovery: existing };
 		const replacement = await retireAndReadReplacement(settings, existing);
 		if (replacement) return { kind: "external-discovery", discovery: replacement };
+	}
+	if (!existing && !priorOwner && settings.expectedPackageGeneration !== undefined) {
+		const leftover = await peekUnstampedLiveBroker(settings.agentDir);
+		if (leftover) {
+			const replacement = await retireAndReadReplacement(settings, leftover);
+			if (replacement) return { kind: "external-discovery", discovery: replacement };
+			if (isPidAlive(leftover.pid))
+				throw staleBrokerRetirementUnverified(settings.expectedPackageGeneration, leftover.packageGeneration, {
+					agentDir: settings.agentDir,
+					stale: leftover,
+				});
+		}
 	}
 
 	const command = resolveSdkInternalSpawnCommand("broker-internal");

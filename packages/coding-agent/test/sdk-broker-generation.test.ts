@@ -501,6 +501,40 @@ describe("sdk broker package generation", () => {
 			await cleanup(dir);
 		}
 	}, 15_000);
+	it("does not spawn over an unstamped live pid whose heartbeat already expired", async () => {
+		const dir = await temp();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		const connect = vi.spyOn(SdkClient, "connect").mockRejectedValue(new Error("broker unreachable"));
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "unknown",
+				ownerId: "legacy-unstamped-expired",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "legacy-unstamped-expired-token",
+				startedAt: Date.now() - 60_000,
+				heartbeatAt: Date.now() - 60_000,
+			});
+			const authority = resolveSdkPackageAuthority();
+			await expect(
+				ensureBroker({
+					agentDir: dir,
+					expectedPackageGeneration: authority.generation,
+				}),
+			).rejects.toThrow(
+				`stale broker retirement was not verified. Stop the broker at pid ${process.pid}, or delete ${brokerDiscoveryPath(dir)}.`,
+			);
+		} finally {
+			connect.mockRestore();
+			await cleanup(dir);
+		}
+	}, 15_000);
 
 	it("does not signal a reused pid published by an unstamped discovery", async () => {
 		const dir = await temp();
@@ -534,13 +568,15 @@ describe("sdk broker package generation", () => {
 				heartbeatAt: Date.now(),
 			});
 			const authority = resolveSdkPackageAuthority();
-			const replacement = await ensureBroker({
-				agentDir: dir,
-				expectedPackageGeneration: authority.generation,
-			});
+			await expect(
+				ensureBroker({
+					agentDir: dir,
+					expectedPackageGeneration: authority.generation,
+				}),
+			).rejects.toThrow(
+				`stale broker retirement was not verified. Stop the broker at pid ${pid}, or delete ${brokerDiscoveryPath(dir)}.`,
+			);
 			expect(signalRoot).not.toHaveBeenCalled();
-			expect(replacement.packageGeneration).toBe(authority.generation);
-			expect(replacement.pid).not.toBe(pid);
 		} finally {
 			fromPid.mockRestore();
 			await cleanup(dir);
