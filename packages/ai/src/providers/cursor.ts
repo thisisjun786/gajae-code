@@ -652,6 +652,14 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				throw new Error("Cursor API key (access token) is required");
 			}
 			if (options?.signal?.aborted) throw cursorAbortError(options.signal);
+			// Cursor owns the first-event watchdog, so its budget starts before
+			// history/blob/protobuf serialization. Synchronous setup cannot be
+			// interrupted by a timer; the remaining-budget check below prevents a
+			// credential-bearing request after serialization already exhausted it.
+			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
+			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
+			const firstEventStartedAt = Date.now();
+			const endpointClass = model.baseUrl ? "custom" : "canonical";
 
 			const conversationId = options?.conversationId ?? options?.sessionId ?? crypto.randomUUID();
 			const blobStore = conversationBlobStores.get(conversationId) ?? new Map<string, Uint8Array>();
@@ -676,10 +684,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			// proxy tunnel connect below waits up to its own 30s timeout before any
 			// watchdog would otherwise be armed. A caller-supplied
 			// streamFirstEventTimeoutMs shorter than that must still bound setup.
-			const idleTimeoutMs = options?.streamIdleTimeoutMs ?? getStreamIdleTimeoutMs();
-			const firstEventTimeoutMs = options?.streamFirstEventTimeoutMs ?? getStreamFirstEventTimeoutMs(idleTimeoutMs);
-			const firstEventStartedAt = Date.now();
-			const endpointClass = model.baseUrl ? "custom" : "canonical";
 			const createFirstEventTimeoutError = (): FirstEventTimeoutError =>
 				new FirstEventTimeoutError("Cursor stream timed out while waiting for the first transport event", {
 					requestBytes: requestBytes.length,
@@ -715,10 +719,20 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					() => new Error("Cursor stream stalled while waiting for the next event"),
 				);
 			};
-			let firstEventWatchdogArmed = false;
+			const remainingFirstEventTimeoutMs =
+				firstEventTimeoutMs === undefined || firstEventTimeoutMs <= 0
+					? firstEventTimeoutMs
+					: firstEventTimeoutMs - (Date.now() - firstEventStartedAt);
+			if (
+				remainingFirstEventTimeoutMs !== undefined &&
+				firstEventTimeoutMs !== undefined &&
+				firstEventTimeoutMs > 0 &&
+				remainingFirstEventTimeoutMs <= 0
+			) {
+				throw createFirstEventTimeoutError();
+			}
+			armTransportWatchdog(remainingFirstEventTimeoutMs, createFirstEventTimeoutError);
 			if (proxyUrl) {
-				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
-				firstEventWatchdogArmed = true;
 				// The watchdog settles the h2 promise but cannot interrupt the
 				// handshake await below: race the tunnel connect against the same
 				// first-event deadline so setup is actually bounded, and destroy the
@@ -730,7 +744,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				let tunnelDeadline: NodeJS.Timeout | undefined;
 				const deadline = Promise.withResolvers<never>();
 				const boundedTunnel =
-					firstEventTimeoutMs !== undefined && firstEventTimeoutMs > 0
+					remainingFirstEventTimeoutMs !== undefined && remainingFirstEventTimeoutMs > 0
 						? Promise.race([
 								tunnel,
 								deadline.promise.catch(error => {
@@ -742,7 +756,10 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					// The rejection may never be observed when the tunnel wins the
 					// race; keep it handled so it cannot surface as unhandled.
 					deadline.promise.catch(() => {});
-					tunnelDeadline = setTimeout(() => deadline.reject(createFirstEventTimeoutError()), firstEventTimeoutMs);
+					tunnelDeadline = setTimeout(
+						() => deadline.reject(createFirstEventTimeoutError()),
+						remainingFirstEventTimeoutMs,
+					);
 				}
 				try {
 					proxiedSocket = await (boundedTunnel ?? tunnel);
@@ -1034,11 +1051,8 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			};
 
 			heartbeatTimer = setInterval(sendHeartbeat, 5000);
-			// Already armed before the proxy handshake: do not restart the clock,
-			// or setup time would be refunded into the first-event budget.
-			if (!firstEventWatchdogArmed) {
-				armTransportWatchdog(firstEventTimeoutMs, createFirstEventTimeoutError);
-			}
+			// The first-event watchdog was armed for all setup paths before HTTP/2
+			// connection/request creation; never restart it and refund setup time.
 			await h2Completion.promise;
 
 			if (state.currentTextBlock) {
