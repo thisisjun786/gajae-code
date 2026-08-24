@@ -6,11 +6,17 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { Broker } from "../src/sdk/broker/broker";
-import { brokerProcessIncarnation, readBrokerDiscovery, writeBrokerDiscovery } from "../src/sdk/broker/discovery";
+import {
+	brokerDiscoveryPath,
+	brokerProcessIncarnation,
+	readBrokerDiscovery,
+	writeBrokerDiscovery,
+} from "../src/sdk/broker/discovery";
 import {
 	brokerOwnerForTest,
 	canRetireStaleBrokerForTest,
 	ensureBroker,
+	isLegacyUnstampedDiscoveryForTest,
 	matchesExpectedBrokerAuthorityForTest,
 	registerBrokerOwnerForTest,
 	signalExactBrokerForTest,
@@ -347,7 +353,7 @@ describe("sdk broker package generation", () => {
 				heartbeatAt: Date.now(),
 			});
 			await expect(ensureBroker({ agentDir: dir, expectedPackageGeneration: authority.generation })).rejects.toThrow(
-				"stale broker retirement was not verified",
+				`stale broker retirement was not verified. Stop the broker at pid ${pid}, or delete ${brokerDiscoveryPath(dir)}.`,
 			);
 			expect(signalRoot).not.toHaveBeenCalled();
 		} finally {
@@ -355,6 +361,240 @@ describe("sdk broker package generation", () => {
 			await fs.rm(dir, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	it("retires a live unstamped unknown-generation broker through authenticated shutdown", async () => {
+		const dir = await temp();
+		const token = "unstamped-unknown-generation-token";
+		const stopped = Promise.withResolvers<void>();
+		const stop = vi.fn(async () => {
+			await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+			stopped.resolve();
+		});
+		const transport = new BrokerTransport(
+			{
+				handleRequest: vi.fn(async () => ({ ok: true, result: { drained: true } })),
+				stop,
+			} as unknown as Broker,
+			token,
+		);
+		const port = await transport.start();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "unknown",
+				ownerId: "legacy-unstamped",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port,
+				url: `ws://127.0.0.1:${port}`,
+				token,
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const authority = resolveSdkPackageAuthority();
+			const replacement = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+			});
+			await stopped.promise;
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(replacement.pid).not.toBe(process.pid);
+			expect(replacement.packageGeneration).toBe(authority.generation);
+			expect(replacement.packageVersion).toBe(authority.packageVersion);
+			expect(replacement.installationIdentity).toBe(authority.installationIdentity);
+		} finally {
+			await transport.stop();
+			await cleanup(dir);
+		}
+	}, 30_000);
+
+	it("preserves admitted work on an unstamped broker instead of signalling", async () => {
+		const dir = await temp();
+		const token = "unstamped-admitted-work-token";
+		const admitted = Promise.withResolvers<{ ok: true; result: { drained: true } }>();
+		const admittedStarted = Promise.withResolvers<void>();
+		const stopped = Promise.withResolvers<void>();
+		const stop = vi.fn(async () => {
+			await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+			stopped.resolve();
+		});
+		const handleRequest = vi.fn(() => {
+			admittedStarted.resolve();
+			return admitted.promise;
+		});
+		const transport = new BrokerTransport({ handleRequest, stop } as unknown as Broker, token);
+		const port = await transport.start();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		const client = await SdkClient.connect(`ws://127.0.0.1:${port}`, token, { reconnectAttempts: 0 });
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "unknown",
+				ownerId: "legacy-unstamped-admitted",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port,
+				url: `ws://127.0.0.1:${port}`,
+				token,
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const work = client.global("session.list", {});
+			await admittedStarted.promise;
+			await expect(
+				ensureBroker({ agentDir: dir, expectedPackageGeneration: resolveSdkPackageGeneration() }),
+			).rejects.toThrow("stale broker retirement was not verified");
+			expect(stop).not.toHaveBeenCalled();
+			admitted.resolve({ ok: true, result: { drained: true } });
+			await expect(work).resolves.toMatchObject({ ok: true, result: { drained: true } });
+			await stopped.promise;
+			expect(stop).toHaveBeenCalledTimes(1);
+		} finally {
+			await client.close().catch(() => {});
+			await transport.stop();
+			await cleanup(dir);
+		}
+	}, 15_000);
+
+	it("evicts an unstamped broker after heartbeat TTL when shutdown does not answer", async () => {
+		const dir = await temp();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		const connect = vi.spyOn(SdkClient, "connect").mockRejectedValue(new Error("broker unreachable"));
+		try {
+			expect(incarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "unknown",
+				ownerId: "legacy-unstamped-ttl",
+				pid: process.pid,
+				incarnation: incarnation!,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "legacy-unstamped-ttl-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const authority = resolveSdkPackageAuthority();
+			const replacement = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+				heartbeatTtlMs: 80,
+			});
+			expect(replacement.pid).not.toBe(process.pid);
+			expect(replacement.packageGeneration).toBe(authority.generation);
+		} finally {
+			connect.mockRestore();
+			await cleanup(dir);
+		}
+	}, 30_000);
+
+	it("does not signal a reused pid published by an unstamped discovery", async () => {
+		const dir = await temp();
+		const pid = process.ppid;
+		const processRef = nativeProcessBindings().Process.fromPid(pid);
+		const liveIncarnation = processRef?.incarnation ?? brokerProcessIncarnation(pid);
+		const originalFromPid = nativeProcessBindings().Process.fromPid.bind(nativeProcessBindings().Process);
+		const signalRoot = vi.fn(() => true);
+		const fromPid = vi.spyOn(nativeProcessBindings().Process, "fromPid").mockImplementation(candidate => {
+			const real = originalFromPid(candidate);
+			if (!real) return real;
+			if (candidate === pid) {
+				return { incarnation: real.incarnation, signalRoot } as never;
+			}
+			return real;
+		});
+		try {
+			expect(liveIncarnation).toBeString();
+			await writeBrokerDiscovery(dir, {
+				version: 1,
+				protocolVersion: 3,
+				packageGeneration: "unknown",
+				ownerId: "legacy-pid-reuse",
+				pid,
+				incarnation: `${liveIncarnation}-reused`,
+				host: "127.0.0.1",
+				port: 1,
+				url: "ws://127.0.0.1:1",
+				token: "legacy-pid-reuse-token",
+				startedAt: Date.now(),
+				heartbeatAt: Date.now(),
+			});
+			const authority = resolveSdkPackageAuthority();
+			const replacement = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+			});
+			expect(signalRoot).not.toHaveBeenCalled();
+			expect(replacement.packageGeneration).toBe(authority.generation);
+			expect(replacement.pid).not.toBe(pid);
+		} finally {
+			fromPid.mockRestore();
+			await cleanup(dir);
+		}
+	}, 30_000);
+
+	it("retires the issue-shaped null-identity discovery record through shutdown", async () => {
+		const dir = await temp();
+		const token = "issue-4910-null-identity-token";
+		const stopped = Promise.withResolvers<void>();
+		const stop = vi.fn(async () => {
+			await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+			stopped.resolve();
+		});
+		const transport = new BrokerTransport(
+			{
+				handleRequest: vi.fn(async () => ({ ok: true, result: { drained: true } })),
+				stop,
+			} as unknown as Broker,
+			token,
+		);
+		const port = await transport.start();
+		const incarnation = brokerProcessIncarnation(process.pid);
+		try {
+			expect(incarnation).toBeString();
+			await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
+			await Bun.write(
+				brokerDiscoveryPath(dir),
+				`${JSON.stringify({
+					version: 1,
+					protocolVersion: 3,
+					packageGeneration: "unknown",
+					packageVersion: null,
+					installationIdentity: null,
+					ownerId: "issue-4910",
+					pid: process.pid,
+					incarnation,
+					host: "127.0.0.1",
+					port,
+					url: `ws://127.0.0.1:${port}`,
+					token,
+					startedAt: Date.now(),
+					heartbeatAt: Date.now(),
+				})}\n`,
+			);
+			const authority = resolveSdkPackageAuthority();
+			const replacement = await ensureBroker({
+				agentDir: dir,
+				expectedPackageGeneration: authority.generation,
+			});
+			await stopped.promise;
+			expect(stop).toHaveBeenCalledTimes(1);
+			expect(replacement.packageGeneration).toBe(authority.generation);
+			expect(replacement.pid).not.toBe(process.pid);
+		} finally {
+			await transport.stop();
+			await cleanup(dir);
+		}
+	}, 30_000);
 
 	it("fails closed when Darwin cannot signal an identity-bound stale broker", () => {
 		const originalPlatform = process.platform;
@@ -420,6 +660,16 @@ describe("sdk broker package generation", () => {
 				{ ...authority, packageVersion: "1.0.0-beta.10" },
 			),
 		).toBe(false);
+		expect(canRetireStaleBrokerForTest({ ...base, packageVersion: undefined }, authority)).toBe(false);
+		expect(
+			canRetireStaleBrokerForTest(
+				{ ...base, installationIdentity: undefined, packageGeneration: "unknown" },
+				authority,
+			),
+		).toBe(false);
+		expect(isLegacyUnstampedDiscoveryForTest({ ...base, packageVersion: undefined })).toBe(true);
+		expect(isLegacyUnstampedDiscoveryForTest({ ...base, installationIdentity: undefined })).toBe(true);
+		expect(isLegacyUnstampedDiscoveryForTest(base)).toBe(false);
 	});
 
 	it("does not signal a newer broker when the caller generation is stale", async () => {
@@ -487,7 +737,7 @@ describe("sdk broker package generation", () => {
 			connect.mockRestore();
 			await fs.rm(dir, { recursive: true, force: true });
 		}
-	});
+	}, 15_000);
 
 	it("refuses to signal a substituted process incarnation", () => {
 		const processRef = {

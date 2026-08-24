@@ -449,6 +449,14 @@ function hasCompletePackageAuthority(discovery: BrokerDiscovery): boolean {
 	return typeof discovery.packageVersion === "string" && typeof discovery.installationIdentity === "string";
 }
 
+function isLegacyUnstampedDiscovery(discovery: BrokerDiscovery): boolean {
+	return !hasCompletePackageAuthority(discovery);
+}
+
+function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): string {
+	return ` Stop the broker at pid ${stale.pid}, or delete ${brokerDiscoveryPath(agentDir)}.`;
+}
+
 async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
 	try {
 		await fs.access(brokerDiscoveryPath(agentDir));
@@ -479,10 +487,12 @@ function isAuthorizedBrokerEndpoint(discovery: BrokerDiscovery): boolean {
 
 /**
  * Stop a live broker whose published generation differs from the package this
- * process would spawn. The authenticated `broker.shutdown` op is tried first;
- * brokers that predate the op (or fail transport) take an identity-fenced
- * SIGTERM instead. Retirement is best-effort, but a mismatched discovery that
- * remains published is never returned to a lifecycle caller.
+ * process would spawn. The authenticated `broker.shutdown` op is tried first.
+ * Ordered same-install discoveries that predate the op (or fail transport) take
+ * an identity-fenced SIGTERM instead. Legacy records that lack version/identity
+ * are shut down through the same authenticated path, or treated as evicted once
+ * their heartbeat TTL lapses; they are never signalled. A mismatched discovery
+ * that remains published is never returned to a lifecycle caller.
  */
 async function retireStaleBroker(
 	agentDir: string,
@@ -492,13 +502,15 @@ async function retireStaleBroker(
 ): Promise<boolean> {
 	const preflightAuthority = resolveSdkPackageAuthority({ force: true });
 	if (preflightAuthority.generation !== expectedPackageGeneration) return false;
-	if (!hasCompletePackageAuthority(stale) || !canRetireStaleBroker(stale, preflightAuthority)) return false;
+	const unstamped = isLegacyUnstampedDiscovery(stale);
+	if (unstamped) {
+		if (!isAuthorizedBrokerEndpoint(stale)) return false;
+	} else if (!canRetireStaleBroker(stale, preflightAuthority)) {
+		return false;
+	}
 	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-	if (
-		!currentBeforeConnect ||
-		!sameBrokerIdentity(currentBeforeConnect, stale) ||
-		!sameBrokerAuthority(currentBeforeConnect, stale)
-	)
+	if (!currentBeforeConnect) return unstamped;
+	if (!sameBrokerIdentity(currentBeforeConnect, stale) || !sameBrokerAuthority(currentBeforeConnect, stale))
 		return false;
 	if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
 	try {
@@ -512,24 +524,32 @@ async function retireStaleBroker(
 			await client.close().catch(() => {});
 		}
 	} catch {
-		// RPC unreachable or unknown_operation (broker predates the shutdown op):
-		// Re-read both installation authority and the publication identity immediately
-		// before signaling. A replacement or package mutation must never be targeted.
-		const currentAuthority = resolveSdkPackageAuthority({ force: true });
-		if (currentAuthority.generation !== expectedPackageGeneration) return false;
-		if (!canRetireStaleBroker(stale, currentAuthority)) return false;
-		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-		if (!current) return true;
-		if (!sameBrokerIdentity(current, stale)) return true;
-		if (!sameBrokerAuthority(current, stale)) return false;
-		if (!isAuthorizedBrokerEndpoint(current)) return false;
-		if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
+		if (unstamped) {
+			// Generation inequality without version/identity cannot authorize SIGTERM.
+			// Authenticated shutdown was attempted; if the publication is already gone
+			// or its heartbeat has lapsed, treat it as evicted rather than signalling.
+			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+			if (!current || !sameBrokerIdentity(current, stale)) return true;
+		} else {
+			// RPC unreachable or unknown_operation (broker predates the shutdown op):
+			// Re-read both installation authority and the publication identity immediately
+			// before signaling. A replacement or package mutation must never be targeted.
+			const currentAuthority = resolveSdkPackageAuthority({ force: true });
+			if (currentAuthority.generation !== expectedPackageGeneration) return false;
+			if (!canRetireStaleBroker(stale, currentAuthority)) return false;
+			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
+			if (!current) return true;
+			if (!sameBrokerIdentity(current, stale)) return true;
+			if (!sameBrokerAuthority(current, stale)) return false;
+			if (!isAuthorizedBrokerEndpoint(current)) return false;
+			if (!signalExactBroker(stale.pid, stale.incarnation)) return false;
+		}
 	}
 	const deadline = Date.now() + STALE_BROKER_SHUTDOWN_TIMEOUT_MS;
 	while (Date.now() < deadline) {
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 		if (!current) {
-			if (await brokerDiscoveryFileAbsent(agentDir)) return true;
+			if (unstamped || (await brokerDiscoveryFileAbsent(agentDir))) return true;
 		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
 		await sleep(50);
 	}
@@ -620,9 +640,11 @@ function matchesExpectedPackageGeneration(
 function staleBrokerRetirementUnverified(
 	expectedPackageGeneration: string,
 	actualPackageGeneration: string | undefined,
+	remedy?: { agentDir: string; stale: BrokerDiscovery },
 ): Error {
+	const detail = remedy ? staleBrokerRetirementRemedy(remedy.agentDir, remedy.stale) : "";
 	return new Error(
-		`SDK broker package generation ${actualPackageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified.`,
+		`SDK broker package generation ${actualPackageGeneration ?? "unknown"} does not match expected generation ${expectedPackageGeneration}, and stale broker retirement was not verified.${detail}`,
 	);
 }
 
@@ -643,21 +665,33 @@ async function retireAndReadReplacement(
 			settings.expectedInstallationIdentity !== authority.installationIdentity)
 	)
 		throw new Error("SDK broker package installation identity changed before retirement.");
-	if (!hasCompletePackageAuthority(stale)) {
-		// A legacy record has no ordered installation authority. Generation
-		// inequality alone cannot prove that it predates this package, so it is
-		// never signalled or retired destructively.
-		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
+	if (isLegacyUnstampedDiscovery(stale)) {
+		// A legacy record has no ordered installation authority, so generation
+		// inequality alone cannot authorize SIGTERM. Authenticated shutdown on a
+		// loopback endpoint is still attempted; unverified records keep the operator
+		// remedy instead of remaining an unexplained blocker.
+		if (!isAuthorizedBrokerEndpoint(stale))
+			throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration, {
+				agentDir: settings.agentDir,
+				stale,
+			});
+	} else if (!canRetireStaleBroker(stale, authority)) {
+		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration, {
+			agentDir: settings.agentDir,
+			stale,
+		});
 	}
-	if (!canRetireStaleBroker(stale, authority))
-		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
 	const retired = await retireStaleBroker(
 		settings.agentDir,
 		stale,
 		expectedPackageGeneration,
 		settings.heartbeatTtlMs,
 	);
-	if (!retired) throw staleBrokerRetirementUnverified(expectedPackageGeneration, stale.packageGeneration);
+	if (!retired)
+		throw staleBrokerRetirementUnverified(expectedPackageGeneration, stale.packageGeneration, {
+			agentDir: settings.agentDir,
+			stale,
+		});
 	const replacement = await readBrokerDiscovery(settings.agentDir, settings.heartbeatTtlMs);
 	if (!replacement) return undefined;
 	const currentPackageGeneration = resolveSdkPackageAuthority({ force: true }).generation;
@@ -1008,6 +1042,10 @@ export function brokerOwnerForTest(agentDir: string): BrokerOwner | undefined {
 /** Test hook: exercise the identity-fenced stale-broker signal fallback. */
 export function signalExactBrokerForTest(pid: number, incarnation: string): boolean {
 	return signalExactBroker(pid, incarnation);
+}
+/** Test hook: legacy unstamped discoveries are shutdown-only, never signalled. */
+export function isLegacyUnstampedDiscoveryForTest(discovery: BrokerDiscovery): boolean {
+	return isLegacyUnstampedDiscovery(discovery);
 }
 /** Test hook: validates ordered same-install retirement authority. */
 export function canRetireStaleBrokerForTest(stale: BrokerDiscovery, authority: SdkPackageAuthority): boolean {
