@@ -472,7 +472,10 @@ function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): 
 	return ` Stop the broker at pid ${stale.pid}, or delete ${brokerDiscoveryPath(agentDir)}.`;
 }
 function unstampedProcessGone(stale: BrokerDiscovery): boolean {
-	return !isPidAlive(stale.pid) || brokerProcessIncarnation(stale.pid) !== stale.incarnation;
+	if (!isPidAlive(stale.pid)) return true;
+	const incarnation = brokerProcessIncarnation(stale.pid);
+	if (incarnation === undefined || incarnation === "") return false;
+	return incarnation !== stale.incarnation;
 }
 
 async function unstampedPublicationEvicted(agentDir: string, stale: BrokerDiscovery): Promise<boolean> {
