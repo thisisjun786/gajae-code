@@ -478,11 +478,6 @@ function unstampedProcessGone(stale: BrokerDiscovery): boolean {
 	return incarnation !== stale.incarnation;
 }
 
-async function unstampedPublicationEvicted(agentDir: string, stale: BrokerDiscovery): Promise<boolean> {
-	if (await brokerDiscoveryFileAbsent(agentDir)) return true;
-	return unstampedProcessGone(stale);
-}
-
 async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
 	try {
 		await fs.access(brokerDiscoveryPath(agentDir));
@@ -539,11 +534,12 @@ async function retireStaleBroker(
 	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 	if (!currentBeforeConnect) {
 		if (!unstamped) return false;
-		return unstampedPublicationEvicted(agentDir, stale);
+		return unstampedProcessGone(stale);
 	}
 	if (!sameBrokerIdentity(currentBeforeConnect, stale) || !sameBrokerAuthority(currentBeforeConnect, stale))
 		return false;
 	if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
+	let shutdownAccepted = false;
 	try {
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
@@ -551,6 +547,7 @@ async function retireStaleBroker(
 		});
 		try {
 			await client.global("broker.shutdown", {});
+			shutdownAccepted = true;
 		} finally {
 			await client.close().catch(() => {});
 		}
@@ -558,9 +555,9 @@ async function retireStaleBroker(
 		if (unstamped) {
 			// Generation inequality without version/identity cannot authorize SIGTERM.
 			// Authenticated shutdown was attempted; treat the publication as gone only
-			// when the file is absent or the published pid/incarnation is no longer live.
+			// when the published pid is dead or its incarnation has been replaced.
 			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-			if (!current) return unstampedPublicationEvicted(agentDir, stale);
+			if (!current) return unstampedProcessGone(stale);
 			if (!sameBrokerIdentity(current, stale)) return true;
 		} else {
 			// RPC unreachable or unknown_operation (broker predates the shutdown op):
@@ -581,8 +578,12 @@ async function retireStaleBroker(
 	while (Date.now() < deadline) {
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 		if (!current) {
-			if (await brokerDiscoveryFileAbsent(agentDir)) return true;
-			if (unstamped && unstampedProcessGone(stale)) return true;
+			if (unstamped) {
+				if (unstampedProcessGone(stale)) return true;
+				if (shutdownAccepted && (await brokerDiscoveryFileAbsent(agentDir))) return true;
+			} else if (await brokerDiscoveryFileAbsent(agentDir)) {
+				return true;
+			}
 		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
 		await sleep(50);
 	}
