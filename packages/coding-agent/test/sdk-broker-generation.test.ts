@@ -530,6 +530,7 @@ describe("sdk broker package generation", () => {
 			).rejects.toThrow(
 				`stale broker retirement was not verified. Stop the broker at pid ${process.pid}, or delete ${brokerDiscoveryPath(dir)}.`,
 			);
+			expect(connect).toHaveBeenCalled();
 		} finally {
 			connect.mockRestore();
 			await cleanup(dir);

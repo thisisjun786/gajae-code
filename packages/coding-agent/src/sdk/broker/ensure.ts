@@ -545,13 +545,17 @@ async function retireStaleBroker(
 		return false;
 	}
 	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-	if (!currentBeforeConnect) {
-		if (!unstamped) return false;
-		return unstampedProcessGone(stale);
-	}
-	if (!sameBrokerIdentity(currentBeforeConnect, stale) || !sameBrokerAuthority(currentBeforeConnect, stale))
+	if (currentBeforeConnect) {
+		if (!sameBrokerIdentity(currentBeforeConnect, stale) || !sameBrokerAuthority(currentBeforeConnect, stale))
+			return false;
+		if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
+	} else if (unstamped) {
+		// TTL-expired publications are invisible to readBrokerDiscovery, but a live
+		// pid still owns the lock. Attempt authenticated shutdown on the peeked record.
+		if (unstampedProcessGone(stale)) return true;
+	} else {
 		return false;
-	if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
+	}
 	let shutdownAccepted = false;
 	try {
 		const client = await SdkClient.connect(stale.url, stale.token, {
