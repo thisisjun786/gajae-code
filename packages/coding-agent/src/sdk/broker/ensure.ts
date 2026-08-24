@@ -556,7 +556,6 @@ async function retireStaleBroker(
 	} else {
 		return false;
 	}
-	let shutdownAccepted = false;
 	try {
 		const client = await SdkClient.connect(stale.url, stale.token, {
 			timeoutMs: STALE_BROKER_SHUTDOWN_TIMEOUT_MS,
@@ -564,7 +563,6 @@ async function retireStaleBroker(
 		});
 		try {
 			await client.global("broker.shutdown", {});
-			shutdownAccepted = true;
 		} finally {
 			await client.close().catch(() => {});
 		}
@@ -598,7 +596,6 @@ async function retireStaleBroker(
 		if (!current) {
 			if (unstamped) {
 				if (unstampedProcessGone(stale)) return true;
-				if (shutdownAccepted && (await brokerDiscoveryFileAbsent(agentDir))) return true;
 			} else if (await brokerDiscoveryFileAbsent(agentDir)) {
 				return true;
 			}

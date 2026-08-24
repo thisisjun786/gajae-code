@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "bun:test";
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -90,6 +90,19 @@ function ownedTestChild(): ChildProcess & { signals: NodeJS.Signals[] } {
 			return true;
 		},
 	}) as unknown as ChildProcess & { signals: NodeJS.Signals[] };
+}
+function standInBrokerProcess(): { pid: number; incarnation: string; kill: () => void } {
+	const child = spawn("sleep", ["3600"], { stdio: "ignore" });
+	if (child.pid === undefined) throw new Error("stand-in broker pid unavailable");
+	const incarnation = brokerProcessIncarnation(child.pid);
+	if (!incarnation) throw new Error("stand-in broker incarnation unavailable");
+	return {
+		pid: child.pid,
+		incarnation,
+		kill() {
+			child.kill("SIGKILL");
+		},
+	};
 }
 
 function olderPackageVersion(version: string): string {
@@ -365,9 +378,11 @@ describe("sdk broker package generation", () => {
 	it("retires a live unstamped unknown-generation broker through authenticated shutdown", async () => {
 		const dir = await temp();
 		const token = "unstamped-unknown-generation-token";
+		const standIn = standInBrokerProcess();
 		const stopped = Promise.withResolvers<void>();
 		const stop = vi.fn(async () => {
 			await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+			standIn.kill();
 			stopped.resolve();
 		});
 		const transport = new BrokerTransport(
@@ -378,16 +393,14 @@ describe("sdk broker package generation", () => {
 			token,
 		);
 		const port = await transport.start();
-		const incarnation = brokerProcessIncarnation(process.pid);
 		try {
-			expect(incarnation).toBeString();
 			await writeBrokerDiscovery(dir, {
 				version: 1,
 				protocolVersion: 3,
 				packageGeneration: "unknown",
 				ownerId: "legacy-unstamped",
-				pid: process.pid,
-				incarnation: incarnation!,
+				pid: standIn.pid,
+				incarnation: standIn.incarnation,
 				host: "127.0.0.1",
 				port,
 				url: `ws://127.0.0.1:${port}`,
@@ -402,11 +415,12 @@ describe("sdk broker package generation", () => {
 			});
 			await stopped.promise;
 			expect(stop).toHaveBeenCalledTimes(1);
-			expect(replacement.pid).not.toBe(process.pid);
+			expect(replacement.pid).not.toBe(standIn.pid);
 			expect(replacement.packageGeneration).toBe(authority.generation);
 			expect(replacement.packageVersion).toBe(authority.packageVersion);
 			expect(replacement.installationIdentity).toBe(authority.installationIdentity);
 		} finally {
+			standIn.kill();
 			await transport.stop();
 			await cleanup(dir);
 		}
@@ -587,9 +601,11 @@ describe("sdk broker package generation", () => {
 	it("retires the issue-shaped null-identity discovery record through shutdown", async () => {
 		const dir = await temp();
 		const token = "issue-4910-null-identity-token";
+		const standIn = standInBrokerProcess();
 		const stopped = Promise.withResolvers<void>();
 		const stop = vi.fn(async () => {
 			await fs.rm(path.join(dir, "sdk", "broker.json"), { force: true });
+			standIn.kill();
 			stopped.resolve();
 		});
 		const transport = new BrokerTransport(
@@ -600,9 +616,7 @@ describe("sdk broker package generation", () => {
 			token,
 		);
 		const port = await transport.start();
-		const incarnation = brokerProcessIncarnation(process.pid);
 		try {
-			expect(incarnation).toBeString();
 			await fs.mkdir(path.join(dir, "sdk"), { recursive: true });
 			await Bun.write(
 				brokerDiscoveryPath(dir),
@@ -613,8 +627,8 @@ describe("sdk broker package generation", () => {
 					packageVersion: null,
 					installationIdentity: null,
 					ownerId: "issue-4910",
-					pid: process.pid,
-					incarnation,
+					pid: standIn.pid,
+					incarnation: standIn.incarnation,
 					host: "127.0.0.1",
 					port,
 					url: `ws://127.0.0.1:${port}`,
@@ -631,8 +645,9 @@ describe("sdk broker package generation", () => {
 			await stopped.promise;
 			expect(stop).toHaveBeenCalledTimes(1);
 			expect(replacement.packageGeneration).toBe(authority.generation);
-			expect(replacement.pid).not.toBe(process.pid);
+			expect(replacement.pid).not.toBe(standIn.pid);
 		} finally {
+			standIn.kill();
 			await transport.stop();
 			await cleanup(dir);
 		}
