@@ -552,10 +552,11 @@ async function retireStaleBroker(
 		if (unstamped) {
 			// Generation inequality without version/identity cannot authorize SIGTERM.
 			// Authenticated shutdown was attempted; treat the publication as gone only
-			// when the published pid is dead or its incarnation has been replaced.
+			// when the published pid is dead. A different discovery while that pid is
+			// still live is not eviction — spawning would collide with the lock.
 			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 			if (!current) return unstampedProcessGone(stale);
-			if (!sameBrokerIdentity(current, stale)) return true;
+			if (!sameBrokerIdentity(current, stale)) return unstampedProcessGone(stale);
 		} else {
 			// RPC unreachable or unknown_operation (broker predates the shutdown op):
 			// Re-read both installation authority and the publication identity immediately
@@ -581,7 +582,9 @@ async function retireStaleBroker(
 			} else if (await brokerDiscoveryFileAbsent(agentDir)) {
 				return true;
 			}
-		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
+		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) {
+			if (!unstamped || unstampedProcessGone(stale)) return true;
+		}
 		await sleep(50);
 	}
 	return false;
