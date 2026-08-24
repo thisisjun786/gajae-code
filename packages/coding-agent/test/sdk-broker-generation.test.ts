@@ -589,7 +589,7 @@ describe("sdk broker package generation", () => {
 					expectedPackageGeneration: authority.generation,
 				}),
 			).rejects.toThrow(
-				`stale broker retirement was not verified. Stop the broker at pid ${pid} before deleting ${brokerDiscoveryPath(dir)}.`,
+				`stale broker retirement was not verified. Published pid ${pid} is live with a different incarnation; do not signal it. Delete ${brokerDiscoveryPath(dir)} only after confirming it is not the SDK broker.`,
 			);
 			expect(signalRoot).not.toHaveBeenCalled();
 		} finally {
