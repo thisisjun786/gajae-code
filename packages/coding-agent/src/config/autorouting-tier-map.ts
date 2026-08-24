@@ -335,6 +335,7 @@ export const TIER_MAP_SKIP_LIST = {
 	"kilo/qwen/qwen3.8-max": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kilo/sakana/fugu-ultra": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kilo/sakana/sakana-namazu": { rationale: "post-rebase catalog addition from dev; not yet curated" },
+	"kilo/stealth/ox-alpha": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kilo/tencent/hy3:free": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kilo/thinkingmachines/inkling-small": { rationale: "post-rebase catalog addition from dev; not yet curated" },
 	"kilo/upstage/solar-pro4": { rationale: "post-rebase catalog addition from dev; not yet curated" },
