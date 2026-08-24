@@ -463,7 +463,7 @@ describe("sdk broker package generation", () => {
 		}
 	}, 15_000);
 
-	it("evicts an unstamped broker after heartbeat TTL when shutdown does not answer", async () => {
+	it("does not spawn over a live unstamped pid after heartbeat TTL when shutdown does not answer", async () => {
 		const dir = await temp();
 		const incarnation = brokerProcessIncarnation(process.pid);
 		const connect = vi.spyOn(SdkClient, "connect").mockRejectedValue(new Error("broker unreachable"));
@@ -484,18 +484,23 @@ describe("sdk broker package generation", () => {
 				heartbeatAt: Date.now(),
 			});
 			const authority = resolveSdkPackageAuthority();
-			const replacement = await ensureBroker({
-				agentDir: dir,
-				expectedPackageGeneration: authority.generation,
-				heartbeatTtlMs: 80,
-			});
-			expect(replacement.pid).not.toBe(process.pid);
-			expect(replacement.packageGeneration).toBe(authority.generation);
+			await expect(
+				ensureBroker({
+					agentDir: dir,
+					expectedPackageGeneration: authority.generation,
+					heartbeatTtlMs: 500,
+				}),
+			).rejects.toThrow(
+				`stale broker retirement was not verified. Stop the broker at pid ${process.pid}, or delete ${brokerDiscoveryPath(dir)}.`,
+			);
+			expect(await readBrokerDiscovery(dir, 500)).toBeNull();
+			const retained = JSON.parse(await fs.readFile(brokerDiscoveryPath(dir), "utf8")) as { pid: number };
+			expect(retained.pid).toBe(process.pid);
 		} finally {
 			connect.mockRestore();
 			await cleanup(dir);
 		}
-	}, 30_000);
+	}, 15_000);
 
 	it("does not signal a reused pid published by an unstamped discovery", async () => {
 		const dir = await temp();

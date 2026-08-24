@@ -6,7 +6,13 @@ import * as os from "node:os";
 import path from "node:path";
 import { nativeProcessBindings } from "@gajae-code/utils/native-process";
 import { SdkClient } from "../client/client";
-import { type BrokerDiscovery, brokerDiscoveryPath, brokerProcessIncarnation, readBrokerDiscovery } from "./discovery";
+import {
+	type BrokerDiscovery,
+	brokerDiscoveryPath,
+	brokerProcessIncarnation,
+	isPidAlive,
+	readBrokerDiscovery,
+} from "./discovery";
 import {
 	resolveSdkInternalSpawnCommand,
 	resolveSdkPackageAuthority,
@@ -456,6 +462,14 @@ function isLegacyUnstampedDiscovery(discovery: BrokerDiscovery): boolean {
 function staleBrokerRetirementRemedy(agentDir: string, stale: BrokerDiscovery): string {
 	return ` Stop the broker at pid ${stale.pid}, or delete ${brokerDiscoveryPath(agentDir)}.`;
 }
+function unstampedProcessGone(stale: BrokerDiscovery): boolean {
+	return !isPidAlive(stale.pid) || brokerProcessIncarnation(stale.pid) !== stale.incarnation;
+}
+
+async function unstampedPublicationEvicted(agentDir: string, stale: BrokerDiscovery): Promise<boolean> {
+	if (await brokerDiscoveryFileAbsent(agentDir)) return true;
+	return unstampedProcessGone(stale);
+}
 
 async function brokerDiscoveryFileAbsent(agentDir: string): Promise<boolean> {
 	try {
@@ -491,8 +505,10 @@ function isAuthorizedBrokerEndpoint(discovery: BrokerDiscovery): boolean {
  * Ordered same-install discoveries that predate the op (or fail transport) take
  * an identity-fenced SIGTERM instead. Legacy records that lack version/identity
  * are shut down through the same authenticated path, or treated as evicted once
- * their heartbeat TTL lapses; they are never signalled. A mismatched discovery
- * that remains published is never returned to a lifecycle caller.
+ * the publication is absent or the published pid/incarnation is gone; they are
+ * never signalled. A heartbeat TTL lapse with a still-live process is not
+ * retirement. A mismatched discovery that remains published is never returned
+ * to a lifecycle caller.
  */
 async function retireStaleBroker(
 	agentDir: string,
@@ -509,7 +525,10 @@ async function retireStaleBroker(
 		return false;
 	}
 	const currentBeforeConnect = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-	if (!currentBeforeConnect) return unstamped;
+	if (!currentBeforeConnect) {
+		if (!unstamped) return false;
+		return unstampedPublicationEvicted(agentDir, stale);
+	}
 	if (!sameBrokerIdentity(currentBeforeConnect, stale) || !sameBrokerAuthority(currentBeforeConnect, stale))
 		return false;
 	if (!isAuthorizedBrokerEndpoint(currentBeforeConnect)) return false;
@@ -526,10 +545,11 @@ async function retireStaleBroker(
 	} catch {
 		if (unstamped) {
 			// Generation inequality without version/identity cannot authorize SIGTERM.
-			// Authenticated shutdown was attempted; if the publication is already gone
-			// or its heartbeat has lapsed, treat it as evicted rather than signalling.
+			// Authenticated shutdown was attempted; treat the publication as gone only
+			// when the file is absent or the published pid/incarnation is no longer live.
 			const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
-			if (!current || !sameBrokerIdentity(current, stale)) return true;
+			if (!current) return unstampedPublicationEvicted(agentDir, stale);
+			if (!sameBrokerIdentity(current, stale)) return true;
 		} else {
 			// RPC unreachable or unknown_operation (broker predates the shutdown op):
 			// Re-read both installation authority and the publication identity immediately
@@ -549,7 +569,8 @@ async function retireStaleBroker(
 	while (Date.now() < deadline) {
 		const current = await readBrokerDiscovery(agentDir, heartbeatTtlMs);
 		if (!current) {
-			if (unstamped || (await brokerDiscoveryFileAbsent(agentDir))) return true;
+			if (await brokerDiscoveryFileAbsent(agentDir)) return true;
+			if (unstamped && unstampedProcessGone(stale)) return true;
 		} else if (current.pid !== stale.pid || current.incarnation !== stale.incarnation) return true;
 		await sleep(50);
 	}
