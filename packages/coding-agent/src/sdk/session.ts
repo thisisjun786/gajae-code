@@ -2711,7 +2711,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Registry load performs v1-to-v2 metadata migration without importing
 		// plugin implementations. Keep this declaration phase before any subskill
 		// tool activation so an entry cannot be live on both paths.
-		const gjcToolDeclarations = await getGjcPluginToolDeclarations(cwd);
+		const gjcToolDeclarations = await getGjcPluginToolDeclarations(cwd, agentDir);
 
 		const gjcSubskillToolContext = options.gjcSubskillToolContext;
 		if (gjcSubskillToolContext?.parent.trim() && gjcSubskillToolContext.phase.trim()) {
@@ -2721,6 +2721,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				parent: gjcSubskillToolContext.parent,
 				phase: gjcSubskillToolContext.phase,
 				reservedToolNames: getReservedSubskillToolNames(),
+				agentDir,
 			});
 			if (pluginTools.length > 0) {
 				customTools.push(...pluginTools);
@@ -2738,6 +2739,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					parent: skill.name,
 					phase,
 					reservedToolNames: getReservedSubskillToolNames(),
+					agentDir,
 				});
 				if (pluginTools.length > 0) {
 					customTools.push(...pluginTools);
@@ -2770,6 +2772,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				cwd,
 				reservedToolNames: [...getReservedSubskillToolNames(), ...customTools.map(tool => tool.name)],
 				declarations: gjcToolDeclarations,
+				agentDir,
 			});
 			if (pluginToolResult.tools.length > 0) {
 				customTools.push(...pluginToolResult.tools);
@@ -3016,7 +3019,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		// Always-on constrained plugin hooks (validated registry surfaces). Additive
 		// and a no-op without installed plugins; the loader denies all dangerous APIs.
 		try {
-			const pluginHookResult = await loadConstrainedPluginHooks({ cwd });
+			const pluginHookResult = await loadConstrainedPluginHooks({ cwd, agentDir });
 			if (pluginHookResult.hooks.length > 0) {
 				inlineExtensions.push(createPluginHooksExtension(pluginHookResult.hooks));
 			}
