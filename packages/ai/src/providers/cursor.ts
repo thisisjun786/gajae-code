@@ -708,7 +708,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				if (execInFlight) return;
 				armTransportWatchdog(
 					idleTimeoutMs,
-					() => new Error("Cursor stream stalled while waiting for transport progress"),
+					() => new Error("Cursor stream stalled while waiting for the next event"),
 				);
 			};
 			let firstEventWatchdogArmed = false;
@@ -828,7 +828,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 			const messageQueue = createCursorMessageQueueForTest(error => {
 				log("error", "handleServerMessage", { error: String(error) });
 				h2Request?.close();
-				settleH2(error);
+				settleBehindFence(() => settleH2(error));
 			});
 			const drainMessageQueue = (): void => {
 				void messageQueue.drain().then(
@@ -838,7 +838,7 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					},
 					error => {
 						queueDrained = true;
-						settleH2(error);
+						settleBehindFence(() => settleH2(error));
 					},
 				);
 			};
@@ -847,21 +847,27 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 				const status = trailers["grpc-status"];
 				const msg = trailers["grpc-message"];
 				if (status && status !== "0") {
-					settleH2(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`));
+					settleBehindFence(() =>
+						settleH2(new Error(`gRPC error ${status}: ${decodeURIComponent(String(msg || ""))}`)),
+					);
 				}
 			});
 			h2Request.on("end", () => {
 				responseEnded = true;
-				drainMessageQueue();
+				processPendingBuffer?.();
+				if (!processingPausedForExec && !processingPausedForQueue && pendingBuffer.length === 0) {
+					drainMessageQueue();
+				}
 			});
 
 			let processingPausedForExec = false;
+			let processingPausedForQueue = false;
 			// True while any exec server message handler is running; suppresses
 			// transport-watchdog refreshes for the duration (see refreshTransportWatchdog).
 			let execInFlight = false;
 			let processPendingBuffer: (() => void) | undefined;
 			processPendingBuffer = () => {
-				if (processingPausedForExec) return;
+				if (processingPausedForExec || processingPausedForQueue) return;
 				while (pendingBuffer.length >= 5) {
 					const flags = pendingBuffer[0];
 					const msgLen = pendingBuffer.readUInt32BE(1);
@@ -957,6 +963,22 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							}
 						});
 						void queued.catch(() => {});
+						// A single HTTP/2 data chunk can contain hundreds of valid,
+						// inexpensive Connect frames. Stop parsing at the queue bound and
+						// resume after the ordered chain drains instead of rejecting the
+						// 257th frame before any queued microtask can decrement pending.
+						if (!isExecServerMessage && messageQueue.pending() >= CURSOR_MAX_PENDING_SERVER_MESSAGES) {
+							processingPausedForQueue = true;
+							h2Request!.pause();
+							void queued.finally(() => {
+								processingPausedForQueue = false;
+								if (!processingPausedForExec && !transportWatchdogClosed && !callerAbortError) {
+									h2Request!.resume();
+									processPendingBuffer?.();
+								}
+							});
+							break;
+						}
 
 						if (isTurnEnded) {
 							sawTurnEnded = true;
@@ -966,6 +988,12 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
 					}
+				}
+				// HTTP/2 can emit `end` while a coalesced chunk still has frames
+				// parked behind queue backpressure. Drain only after every buffered
+				// frame has been parsed into the ordered queue.
+				if (responseEnded && !processingPausedForExec && !processingPausedForQueue && pendingBuffer.length === 0) {
+					drainMessageQueue();
 				}
 			};
 
@@ -2034,6 +2062,7 @@ export async function resolveExecHandler<TArgs, TResult>(
 export function createCursorMessageQueueForTest(onError?: (error: unknown) => void): {
 	enqueue(handler: () => void | Promise<void>): Promise<void>;
 	drain(): Promise<void>;
+	pending(): number;
 } {
 	let chain = Promise.resolve();
 	let pending = 0;
@@ -2060,6 +2089,9 @@ export function createCursorMessageQueueForTest(onError?: (error: unknown) => vo
 		},
 		drain() {
 			return chain;
+		},
+		pending() {
+			return pending;
 		},
 	};
 }
