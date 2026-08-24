@@ -733,10 +733,9 @@ async function retireAndReadReplacement(
 				stale,
 			});
 	} else if (!canRetireStaleBroker(stale, authority)) {
-		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration, {
-			agentDir: settings.agentDir,
-			stale,
-		});
+		// Stamped but not an older same-install broker: do not tell the operator
+		// to stop that pid (it may be newer or a different installation).
+		throw staleBrokerRetirementUnverified(authority.generation, stale.packageGeneration);
 	}
 	const retired = await retireStaleBroker(
 		settings.agentDir,

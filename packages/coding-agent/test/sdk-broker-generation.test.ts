@@ -366,7 +366,7 @@ describe("sdk broker package generation", () => {
 				heartbeatAt: Date.now(),
 			});
 			await expect(ensureBroker({ agentDir: dir, expectedPackageGeneration: authority.generation })).rejects.toThrow(
-				`stale broker retirement was not verified. Stop the broker at pid ${pid} before deleting ${brokerDiscoveryPath(dir)}.`,
+				"stale broker retirement was not verified",
 			);
 			expect(signalRoot).not.toHaveBeenCalled();
 		} finally {
