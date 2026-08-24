@@ -963,6 +963,13 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							}
 						});
 						void queued.catch(() => {});
+						// Terminal bookkeeping belongs to the validated frame boundary,
+						// before parser backpressure can break this loop. The queued handler
+						// still runs in order, while settlement waits for queue drain.
+						if (isTurnEnded) {
+							sawTurnEnded = true;
+							drainMessageQueue();
+						}
 						// A single HTTP/2 data chunk can contain hundreds of valid,
 						// inexpensive Connect frames. Stop parsing at the queue bound and
 						// resume after the ordered chain drains instead of rejecting the
@@ -984,10 +991,6 @@ export const streamCursor: StreamFunction<"cursor-agent"> = (
 							break;
 						}
 
-						if (isTurnEnded) {
-							sawTurnEnded = true;
-							drainMessageQueue();
-						}
 						if (isExecServerMessage) break;
 					} catch (e) {
 						log("error", "parseServerMessage", { error: String(e) });
