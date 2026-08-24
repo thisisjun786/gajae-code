@@ -356,6 +356,7 @@ export interface BuildSkillPromptMessageContext {
 	subskillActivationSet?: LoadedSubskillActivation[];
 	currentPhase?: string;
 	cwd?: string;
+	agentDir?: string;
 	sessionId?: string;
 }
 
@@ -504,6 +505,7 @@ export async function buildSkillPromptMessage(
 		const injection = context.cwd
 			? await buildSubskillInjection({
 					cwd: context.cwd,
+					agentDir: context.agentDir,
 					sessionId: context.sessionId,
 					skillName: skill.name,
 					activation: context.subskillActivation,
@@ -522,6 +524,7 @@ export async function buildSkillPromptMessage(
 			try {
 				const advert = await renderSkillAdvertisement({
 					cwd: context.cwd,
+					agentDir: context.agentDir,
 					skillName: skill.name,
 					phase: context.currentPhase,
 				});

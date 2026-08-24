@@ -9136,7 +9136,14 @@ export class AgentSession {
 		const reservedToolNames = Array.from(this.#toolRegistry.keys()).filter(
 			name => !this.#gjcSubskillToolNames.has(name),
 		);
-		const customTools = await loadActiveSubskillTools({ cwd, sessionId, parent, phase, reservedToolNames });
+		const customTools = await loadActiveSubskillTools({
+			cwd,
+			sessionId,
+			parent,
+			phase,
+			reservedToolNames,
+			agentDir: this.getSessionAgentDir(),
+		});
 		const nextToolNames = customTools.map(tool => tool.name);
 		const uniqueToolNames = new Set(nextToolNames);
 		if (uniqueToolNames.size !== nextToolNames.length) {
@@ -9568,6 +9575,7 @@ export class AgentSession {
 		const activation = await awaitPromptInvocationPreflight(
 			resolveSubskillActivationForSkillInvocation({
 				cwd: this.sessionManager.getCwd(),
+				agentDir: this.getSessionAgentDir(),
 				sessionId: this.sessionId,
 				skillName: skill.name,
 				args,
@@ -9579,6 +9587,7 @@ export class AgentSession {
 				subskillActivation: activation.activation,
 				subskillActivationSet: activation.activeSubskillsToPersist,
 				cwd: this.sessionManager.getCwd(),
+				agentDir: this.getSessionAgentDir(),
 				sessionId: this.sessionId,
 			}),
 			options?.preflightSignal,
